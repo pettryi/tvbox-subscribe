@@ -29,7 +29,7 @@
     "service unavailable"
   ],
   "content_check": true,
-  "content_strict": false,
+  "content_strict": true,
   "allow_empty_result": true,
   "invalid_keywords": [
     "403 forbidden",
