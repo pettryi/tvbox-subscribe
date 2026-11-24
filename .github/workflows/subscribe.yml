@@ -51,6 +51,18 @@ jobs:
       - name: 运行测活脚本
         run: python main.py
 
+      # 报告写进本次运行的摘要，点开运行即可在页面顶部查看，不写回仓库文件
+      - name: 输出测活报告到运行摘要
+        if: always()
+        run: |
+          echo "## 本次测活报告" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f output/status.md ]; then
+            cat output/status.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "> 未生成报告文件（脚本可能在报告写出前失败）。" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # 空订阅保护：抓不到源时不提交，避免把正常的订阅覆盖成 0 站
       - name: 校验并提交主订阅
         run: |
@@ -98,7 +110,10 @@ jobs:
           git config user.name "subscribe-bot"
           git config user.email "subscribe-bot@users.noreply.github.com"
           cp "$GITHUB_WORKSPACE/output/subscribe_adult.json" ./subscribe.json
-          rm -f ./status.md
+          # status.md 不再写回成人仓库，报告只留在运行摘要
+          if git ls-files --error-unmatch status.md >/dev/null 2>&1; then
+            git rm -f --cached status.md
+          fi
           git add -A
           if git diff --cached --quiet; then
             echo "成人订阅无变化，跳过提交"
