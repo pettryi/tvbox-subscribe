@@ -3,14 +3,6 @@
   "wallpaper": "https://饭的动态壁纸.xxooo.cf/",
   "sites": [
     {
-      "key": "暴風",
-      "name": "影视 | 暴風[直连]",
-      "type": 1,
-      "api": "https://bfzyapi.com/api.php/provide/vod/?ac=list",
-      "searchable": 1,
-      "changeable": 1
-    },
-    {
       "key": "建安采集",
       "name": "影视 | 建安",
       "type": 1,
@@ -24,6 +16,23 @@
       "filterable": 1,
       "changeable": 1,
       "playerType": 2
+    },
+    {
+      "key": "暴風",
+      "name": "影视 | 暴風[直连]",
+      "type": 1,
+      "api": "https://bfzyapi.com/api.php/provide/vod/?ac=list",
+      "searchable": 1,
+      "changeable": 1
+    },
+    {
+      "key": "量子资源",
+      "name": "🌼量子┃影视🌼",
+      "type": 1,
+      "api": "https://cj.lziapi.com/api.php/provide/vod/from/lzm3u8",
+      "searchable": 1,
+      "quickSearch": 1,
+      "filterable": 0
     },
     {
       "key": "量子",
@@ -400,8 +409,8 @@
     }
   ],
   "_maintainer": {
-    "updated": "2026-11-24 09:04:17",
-    "alive_sites": 13,
+    "updated": "2026-11-24 09:29:49",
+    "alive_sites": 14,
     "adult_mode": "mark",
     "adult_placement": "separate",
     "note": "成人站点已拆分至单独订阅"
