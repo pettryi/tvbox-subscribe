@@ -1,0 +1,31 @@
+{
+  "sources_file": "sources.txt",
+  "sources": [],
+  "keyword": "test",
+  "timeout": 8,
+  "workers": 12,
+  "retries": 1,
+  "output": "output/subscribe.json",
+  "status": "output/status.md",
+  "keep_lives": true,
+  "keep_parses": true,
+  "min_sites": 1,
+  "min_body": 20,
+  "user_agent": "Mozilla/5.0 (Linux; Android 12) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+  "ua_rotate": true,
+  "adult_mode": "mark",
+  "adult_mark": "🔞",
+  "adult_name_mask": "1BJ",
+  "adult_placement": "separate",
+  "adult_output": "output/subscribe_adult.json",
+  "bad_keywords": [
+    "系统繁忙",
+    "请求频繁",
+    "访问频繁",
+    "too many requests",
+    "系统错误",
+    "访问限制",
+    "请求过多",
+    "service unavailable"
+  ]
+}
