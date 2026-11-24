@@ -1,0 +1,22 @@
+# ===== 令牌 / 私密数据：严禁上传 =====
+token.txt
+*_token*
+新建文本文档.txt
+
+# ===== 真实源 Base64：只用于填 Secrets，严禁上传仓库 =====
+真实源BASE64-填Secrets用.txt
+
+# ===== 真实源（通过 Secrets 注入，运行时才生成） =====
+# 注意：仓库里的 sources.txt 只是空占位模板，真实内容不进仓库
+_probe*
+_payload*
+upload_subscribe.py
+
+# ===== 缓存与运行产物 =====
+__pycache__/
+*.pyc
+cache/
+*.log
+
+# ===== Git =====
+.git/
