@@ -141,6 +141,32 @@ https://raw.githubusercontent.com/pettry/tvbox-subscribe/main/output/subscribe.j
 
 ---
 
+## 内容校验（防"假存活"）
+
+测活不只是看"能不能返回页面"，还会**校验返回内容到底是不是视频源数据**，避免把错误页、验证码页、空壳响应误当成有效源。
+
+判定规则：
+
+| 返回内容 | 判定 |
+|---|---|
+| JSON 有 `list` 且条目含 `vod_id`/`vod_name` 等视频字段 | 有效视频源 |
+| XML 含 `<rss>` + `<video>` + `recordcount` | 有效视频源 |
+| 标准 CMS 空结果（`list:[]` + `code:1`/`recordcount:0`，源正常只是没搜到） | 有效（空结果） |
+| `403`/验证码/登录墙/`code:-1`/纯 HTML 首页/无视频字段的空壳 | 失效 |
+
+相关开关在 `config.json`（按需调整）：
+
+| 开关 | 默认 | 说明 |
+|---|---|---|
+| `content_check` | `true` | 总开关。设为 `false` 回退到旧的"只看能否返回"逻辑 |
+| `content_strict` | `false` | 严格模式。设为 `true` 时连"标准空结果"也判失效 |
+| `allow_empty_result` | `true` | 是否把"标准 CMS 空结果"算作有效源 |
+| `invalid_keywords` | 见配置 | 命中即判失效的页面特征词（错误页/验证码等），可自行增删 |
+
+> 说明：搜索关键词默认是 `test`。很多视频源库里没有这个词，会返回**合法的空结果**——这类源本身是好的，默认算作有效。如果你想只保留"能搜出实际视频"的源，把 `content_strict` 设为 `true` 即可。
+
+---
+
 ## 文件说明
 
 | 文件 | 作用 |
