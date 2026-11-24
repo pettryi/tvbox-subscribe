@@ -70,3 +70,35 @@ jobs:
             output/subscribe_adult.json
             output/status.md
           if-no-files-found: ignore
+
+      # 同步成人订阅到私有仓库（需配 ADULT_REPO_TOKEN 与 ADULT_REPO 两个 Secret）
+      # 未配置时自动跳过，不影响主流程
+      - name: 同步成人订阅到私有仓库
+        env:
+          ADULT_REPO_TOKEN: ${{ secrets.ADULT_REPO_TOKEN }}
+          ADULT_REPO: ${{ secrets.ADULT_REPO }}
+        run: |
+          if [ -z "$ADULT_REPO_TOKEN" ] || [ -z "$ADULT_REPO" ]; then
+            echo "未配置 ADULT_REPO_TOKEN/ADULT_REPO，跳过私有仓库同步"
+            exit 0
+          fi
+          if [ ! -f output/subscribe_adult.json ]; then
+            echo "无成人订阅文件，跳过"
+            exit 0
+          fi
+          echo "同步成人订阅到 $ADULT_REPO ..."
+          rm -rf /tmp/adult-repo
+          git clone "https://x-access-token:${ADULT_REPO_TOKEN}@github.com/${ADULT_REPO}.git" /tmp/adult-repo
+          cd /tmp/adult-repo
+          git config user.name "subscribe-bot"
+          git config user.email "subscribe-bot@users.noreply.github.com"
+          cp "$GITHUB_WORKSPACE/output/subscribe_adult.json" ./subscribe.json
+          cp "$GITHUB_WORKSPACE/output/status.md" ./status.md 2>/dev/null || true
+          git add -A
+          if git diff --cached --quiet; then
+            echo "成人订阅无变化，跳过提交"
+          else
+            git commit -m "chore: 自动更新成人订阅"
+            git push origin HEAD:main
+          fi
+          echo "成人订阅已同步到私有仓库"
