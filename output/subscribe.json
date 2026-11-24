@@ -218,6 +218,12 @@
       ]
     },
     {
+      "key": "裤佬体育",
+      "name": "更新公告",
+      "type": 1,
+      "api": "https://7952.kstore.vip/JAR/lib/genxin.json"
+    },
+    {
       "key": "csp_xml_ikun",
       "name": "❤ikun资源",
       "type": 1,
@@ -261,12 +267,6 @@
         "日韩综艺",
         "欧美综艺"
       ]
-    },
-    {
-      "key": "裤佬体育",
-      "name": "更新公告",
-      "type": 1,
-      "api": "https://7952.kstore.vip/JAR/lib/genxin.json"
     },
     {
       "key": "猫眼资源采集",
@@ -381,7 +381,7 @@
     }
   ],
   "_maintainer": {
-    "updated": "2026-11-24 05:13:14",
+    "updated": "2026-11-24 08:34:08",
     "alive_sites": 11,
     "adult_mode": "mark",
     "adult_placement": "separate",
