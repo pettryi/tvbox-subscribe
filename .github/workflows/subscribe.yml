@@ -1,0 +1,72 @@
+name: 订阅源自动维护
+
+# 定时触发用 UTC 时间，'0 0 * * *' = 北京时间每天 08:00
+# workflow_dispatch 允许在网页上手动点「Run workflow」立即跑一次
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+# 允许把生成的订阅提交回仓库（GitHub 新仓库默认只读，必须显式开启）
+permissions:
+  contents: write
+
+jobs:
+  maintain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # 检出到 main 分支而非游离 HEAD，否则最后 git push 会失败
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 真实源通过 Secrets 注入，只存在于本次运行的内存里，不写进仓库
+      - name: 注入真实源（私密变量）
+        env:
+          SOURCES_B64: ${{ secrets.SOURCES_B64 }}
+          MANUAL_SOURCES_B64: ${{ secrets.MANUAL_SOURCES_B64 }}
+        run: |
+          echo "SOURCES_B64 长度: ${#SOURCES_B64}"
+          if [ -z "$SOURCES_B64" ]; then
+            echo "ERROR: SOURCES_B64 未配置。请到 Settings -> Secrets and variables -> Actions 添加。"
+            exit 1
+          fi
+          echo "$SOURCES_B64" | base64 -d > sources.txt
+          echo "sources.txt 行数: $(wc -l < sources.txt)"
+          if [ -n "$MANUAL_SOURCES_B64" ]; then
+            echo "$MANUAL_SOURCES_B64" | base64 -d > manual_sources.txt
+          fi
+
+      - name: 运行测活脚本
+        run: python main.py
+
+      # 空订阅保护：抓不到源时不提交，避免把正常的订阅覆盖成 0 站
+      - name: 校验并提交主订阅
+        run: |
+          python -c 'import json,sys; d=json.load(open("output/subscribe.json",encoding="utf-8")); n=len(d["sites"]); print("主订阅站点数:", n); sys.exit(1 if n==0 else 0)'
+          git config user.name "subscribe-bot"
+          git config user.email "subscribe-bot@users.noreply.github.com"
+          git add output/subscribe.json
+          if git diff --cached --quiet; then
+            echo "订阅无变化，跳过提交"
+          else
+            git commit -m "chore: 自动更新订阅"
+            git push origin HEAD:main
+          fi
+
+      # 成人订阅与报告含敏感内容，只作运行产物留存，不提交到公开仓库
+      - name: 上传成人订阅与报告（私密产物）
+        uses: actions/upload-artifact@v4
+        with:
+          name: private-output
+          path: |
+            output/subscribe_adult.json
+            output/status.md
+          if-no-files-found: ignore
