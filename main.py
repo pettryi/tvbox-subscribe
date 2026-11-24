@@ -79,6 +79,23 @@ DEFAULTS = {
         "系统繁忙", "请求频繁", "访问频繁", "too many requests",
         "系统错误", "访问限制", "请求过多", "service unavailable",
     ],
+    # ===== 内容校验：判断返回的页面是否真的是「视频源内容」 =====
+    # 总开关：只判断"能返回内容"会误收错误页/空壳，开启后校验内容结构
+    "content_check": True,
+    # 严格模式：只认含视频条目字段(vod_id/vod_name/name+url...)的 JSON/XML；
+    #           关闭时，标准 CMS 空结果(list:[] + code/recordcount)也算有效
+    "content_strict": False,
+    # 允许"标准 CMS 空结果"（搜索无匹配但源本身正常）。content_strict=False 时生效
+    "allow_empty_result": True,
+    # 无效页面特征词：命中即判失效（错误页/验证码/登录墙/空壳提示）
+    "invalid_keywords": [
+        "403 forbidden", "404 not found", "access denied", "forbidden",
+        "captcha", "verifycode", "验证码", "请输入验证码",
+        "访问被拒绝", "无权访问", "页面不存在", "请求异常",
+        "系统提示", "操作频繁", "请稍后再试", "服务器错误",
+        "internal server error", "bad gateway", "nginx", "欢迎使用",
+        "请开启javascript", "enable javascript",
+    ],
 }
 
 UA_POOL = [
@@ -492,6 +509,105 @@ def build_probe_url(api, keyword):
     return api + sep + "wd=" + kw
 
 
+# ---- 内容校验：判断响应体是否真的是「视频源内容」 ----
+# 视频条目常见字段（苹果 CMS / TVBox 各类聚合接口）
+_VOD_ITEM_KEYS = (
+    "vod_id", "vod_name", "vod_pic", "vod_play_url", "vod_remarks",
+    "vod_class", "vod_time", "vod_tag", "vod_actor", "vod_director",
+    "name", "title", "url", "play_url", "id", "pic",
+)
+# CMS 结构标志字段：出现这些说明是标准视频源框架，即使 list 为空也算有效源
+_CMS_META_KEYS = (
+    "code", "msg", "page", "pageindex", "pagecount", "pagesize",
+    "recordcount", "total", "limit", "class", "list", "data",
+)
+
+
+def _looks_like_vod_item(obj):
+    """判断一个对象是否像一条视频条目。"""
+    if not isinstance(obj, dict):
+        return False
+    keys = {str(k).lower() for k in obj.keys()}
+    # 命中任一视频字段即认为像条目（真源条目一般一次命中多个）
+    return len(keys & set(_VOD_ITEM_KEYS)) >= 1
+
+
+def classify_content(body, cfg):
+    """分析响应体内容，返回 (类别, 说明)。
+
+    类别取值：
+      'vod'     真视频源（含视频条目）
+      'empty'   标准 CMS 空结果（结构正确，只是没搜到内容）
+      'invalid' 无效内容（错误页/验证码/空壳/非视频源）
+    """
+    text = (body or "").strip()
+    lower = text.lower()
+
+    # 1) 无效页面特征词（错误页、验证码、登录墙、空壳提示）
+    for kw in cfg.get("invalid_keywords", []):
+        if kw and kw.lower() in lower:
+            return "invalid", "命中无效页特征: %s" % kw
+
+    # 2) 解析 JSON
+    data = parse_json_loose(text)
+    if data is not None:
+        containers = []
+        if isinstance(data, list):
+            containers = [("list", data)]
+        elif isinstance(data, dict):
+            # 收集所有可能为列表的字段
+            for k, v in data.items():
+                if isinstance(v, list):
+                    containers.append((k, v))
+        # 2a) 任意列表里出现视频条目 -> 有效
+        for k, v in containers:
+            if v and _looks_like_vod_item(v[0]):
+                return "vod", "%s: %d 条视频" % (k, len(v))
+        # 2b) 有空列表 + CMS 结构标志 -> 标准空结果
+        has_empty_list = any(k in ("list", "data", "videos", "results", "result")
+                             and len(v) == 0 for k, v in containers)
+        if isinstance(data, dict):
+            dkeys = {str(k).lower() for k in data.keys()}
+            has_cms_meta = len(dkeys & set(_CMS_META_KEYS)) >= 2
+            code = data.get("code")
+            # code 显式为失败码（如 -1、400、500、error）且无视频条目 -> 错误响应
+            # 注意：部分 CMS 用 code=0 表示成功，所以 0 不判失败；msg 的失败语义由 invalid_keywords 兜底
+            has_vod = any(v and _looks_like_vod_item(v[0]) for _, v in containers)
+            if (code is not None and str(code).lower() not in ("1", "200", "0", "true")
+                    and not has_vod):
+                return "invalid", "错误响应 code=%s" % code
+            if has_empty_list and has_cms_meta:
+                if cfg.get("content_strict", False):
+                    return "invalid", "空结果(严格模式)"
+                if cfg.get("allow_empty_result", True):
+                    return "empty", "标准空结果(源正常,无匹配)"
+                return "invalid", "空结果(未允许)"
+        # 2c) 有列表但元素不是视频结构 -> 可疑
+        if containers:
+            if cfg.get("content_strict", False):
+                return "invalid", "列表无视频字段(严格模式)"
+            return "invalid", "列表无视频结构"
+        # 2d) 纯对象无任何列表 -> 空壳
+        return "invalid", "JSON 空壳(无视频列表)"
+
+    # 3) 解析 XML（苹果 CMS RSS 格式）
+    if re.search(r"<rss\b", lower) or re.search(r"<(video|item|vod)\b", lower):
+        videos = re.findall(r"<(video|item|vod)\b", lower)
+        has_name = bool(re.search(r"<(name|title|vod_name)\b", lower))
+        has_id = bool(re.search(r"<(id|vod_id)\b", lower))
+        if videos and (has_name or has_id):
+            return "vod", "XML: %d 条视频" % len(videos)
+        if "recordcount=\"0\"" in lower.replace(" ", "") or re.search(r"<list\b", lower):
+            if cfg.get("content_strict", False):
+                return "invalid", "XML 空结果(严格模式)"
+            if cfg.get("allow_empty_result", True):
+                return "empty", "XML 标准空结果"
+        return "invalid", "XML 无视频节点"
+
+    # 4) 其他非结构化内容（HTML/纯文本）一律不算视频源
+    return "invalid", "非视频源内容(%d 字节)" % len(text)
+
+
 def probe_site(site, cfg):
     """测活单个站点，返回 (是否存活, 说明)。"""
     api = site.get("api") or site.get("url") or ""
@@ -508,6 +624,17 @@ def probe_site(site, cfg):
     for bad in cfg.get("bad_keywords", []):
         if bad.lower() in lower:
             return False, "命中异常关键词: %s" % bad
+
+    # 内容校验：判断返回的是否真是视频源
+    if cfg.get("content_check", True):
+        kind, note = classify_content(body, cfg)
+        if kind == "invalid":
+            return False, "内容校验失败: " + note
+        if kind == "empty":
+            return True, "存活(空结果): " + note
+        return True, "有效视频源: " + note
+
+    # —— 关闭内容校验时的旧逻辑（仅判断能否返回）——
     data = parse_json_loose(body)
     if data is not None:
         if isinstance(data, list):
@@ -517,9 +644,7 @@ def probe_site(site, cfg):
                 v = data.get(k)
                 if isinstance(v, list):
                     return (len(v) > 0), ("%s: %d 条" % (k, len(v)) if v else "%s 空" % k)
-            # 有内容但格式未知
             return True, "返回对象(%d 字段)" % len(data)
-    # 非 JSON 但有实体内容，视为可用（部分老式 CMS 返回文本/HTML）
     return True, "非 JSON 响应(%d 字节)" % len(body)
 
 
