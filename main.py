@@ -109,6 +109,12 @@ def log(msg):
     print("[%s] %s" % (time.strftime("%H:%M:%S"), msg), flush=True)
 
 
+def md_cell(v):
+    """转义 Markdown 表格单元格，避免值里的 | / 换行撑破表格。"""
+    s = "" if v is None else str(v)
+    return s.replace("\\", "\\\\").replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
 def load_config(path):
     cfg = dict(DEFAULTS)
     p = path if os.path.isabs(path) else os.path.join(BASE_DIR, path)
@@ -821,7 +827,8 @@ def main():
     report.append("| 层 | 地址 | 名称 | 结果 |")
     report.append("| --- | --- | --- | --- |")
     for depth, url, name, status in expand_logs:
-        report.append("| %d | %s | %s | %s |" % (depth, url, mask_if_adult(name, cfg), status))
+        report.append("| %d | %s | %s | %s |" % (
+            depth, md_cell(url), md_cell(mask_if_adult(name, cfg)), md_cell(status)))
     report.append("")
 
     # 2) 并发测活
@@ -878,7 +885,8 @@ def main():
             report.append("| --- | --- | --- | --- | --- |")
             for ok, name, src, why, api, ad in sorted(adult_all_details, key=lambda x: (not x[0], x[1])):
                 report.append("| %s | %s | %s | %s | %s |" % (
-                    "存活" if ok else "失效", mark_adult_name(name, cfg), api, src, why))
+                    "存活" if ok else "失效", md_cell(mark_adult_name(name, cfg)),
+                    md_cell(api), md_cell(src), md_cell(why)))
         else:
             report.append("> 本次未识别到成人内容站点。")
         report.append("")
@@ -890,7 +898,7 @@ def main():
     for ok, name, src, why, api, ad in sorted(details, key=lambda x: (not x[0], x[1])):
         disp = mark_adult_name(name, cfg) if ad else name
         report.append("| %s | %s | %s | %s | %s |" % (
-            "存活" if ok else "失效", disp, api, src, why))
+            "存活" if ok else "失效", md_cell(disp), md_cell(api), md_cell(src), md_cell(why)))
 
     # 3) 生成订阅（成人站点按 adult_placement 拆分/混排/仅报告）
     subscription, adult_subscription, adult_alive = merge_subscription(leaves, alive, cfg)
