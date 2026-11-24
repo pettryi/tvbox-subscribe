@@ -6,6 +6,12 @@ on:
   schedule:
     - cron: '0 0 * * *'
   workflow_dispatch:
+  # 网页提交新源：在 GitHub 上编辑 manual_sources.txt 并 commit 后自动跑一次
+  push:
+    branches:
+      - main
+    paths:
+      - 'manual_sources.txt'
 
 # 允许把生成的订阅提交回仓库（GitHub 新仓库默认只读，必须显式开启）
 permissions:
@@ -27,11 +33,10 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 真实源通过 Secrets 注入，只存在于本次运行的内存里，不写进仓库
+      # 主源清单通过 Secret 注入（含成人站，不进仓库）；手工源直接读仓库里的 manual_sources.txt
       - name: 注入真实源（私密变量）
         env:
           SOURCES_B64: ${{ secrets.SOURCES_B64 }}
-          MANUAL_SOURCES_B64: ${{ secrets.MANUAL_SOURCES_B64 }}
         run: |
           echo "SOURCES_B64 长度: ${#SOURCES_B64}"
           if [ -z "$SOURCES_B64" ]; then
@@ -40,9 +45,8 @@ jobs:
           fi
           echo "$SOURCES_B64" | base64 -d > sources.txt
           echo "sources.txt 行数: $(wc -l < sources.txt)"
-          if [ -n "$MANUAL_SOURCES_B64" ]; then
-            echo "$MANUAL_SOURCES_B64" | base64 -d > manual_sources.txt
-          fi
+          # 手工源在网页上直接编辑 manual_sources.txt 提交即可，这里只做展示
+          echo "manual_sources.txt 手工源条数: $(grep -v '^\s*#' manual_sources.txt 2>/dev/null | grep -v '^\s*$' | wc -l)"
 
       - name: 运行测活脚本
         run: python main.py
