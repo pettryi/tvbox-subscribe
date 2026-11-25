@@ -64,16 +64,18 @@ jobs:
           fi
 
       # 空订阅保护：抓不到源时不提交，避免把正常的订阅覆盖成 0 站
-      - name: 校验并提交主订阅
+      # 主订阅(Top N) 与 全量订阅 一起提交到公开仓库，用户可按需选用
+      - name: 校验并提交订阅
         run: |
-          python -c 'import json,sys; d=json.load(open("output/subscribe.json",encoding="utf-8")); n=len(d["sites"]); print("主订阅站点数:", n); sys.exit(1 if n==0 else 0)'
+          python -c 'import json,sys; d=json.load(open("output/subscribe.json",encoding="utf-8")); n=len(d["sites"]); print("主订阅(Top N)站点数:", n); sys.exit(1 if n==0 else 0)'
+          python -c 'import json,sys; d=json.load(open("output/subscribe_all.json",encoding="utf-8")); n=len(d["sites"]); print("全量订阅站点数:", n); sys.exit(1 if n==0 else 0)'
           git config user.name "subscribe-bot"
           git config user.email "subscribe-bot@users.noreply.github.com"
-          git add output/subscribe.json
+          git add output/subscribe.json output/subscribe_all.json
           if git diff --cached --quiet; then
             echo "订阅无变化，跳过提交"
           else
-            git commit -m "chore: 自动更新订阅"
+            git commit -m "chore: 自动更新订阅(主订阅Top N + 全量)"
             git push origin HEAD:main
           fi
 
