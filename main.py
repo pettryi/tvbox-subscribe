@@ -692,14 +692,16 @@ def _probe_http(api, keyword, cfg):
     return True, "非 JSON 响应(%d 字节)" % len(body), "vod"
 
 
-def probe_http_api(api, cfg):
+def probe_http_api(api, cfg, site=None):
     """对一个 http api 用「多关键词」测活（换词后再判）。
 
     返回 (是否存活, 说明, 是否曾拿到真实视频)。
     - 任一关键词拿到真视频条目 -> 存活
     - 全部关键词都只是标准空结果 -> 由 allow_empty_result / content_strict 决定
     - 否则失效
+    同时把本次响应耗时(ms)写入 site["_latency_ms"]，供速度排序使用。
     """
+    t0 = time.time()
     kws = [cfg.get("keyword", "test")]
     for k in cfg.get("probe_keywords", []) or []:
         if k and k not in kws:
@@ -708,10 +710,17 @@ def probe_http_api(api, cfg):
     kws = kws[:max(1, limit)]
 
     empty_notes, bad_notes, first_err = [], [], ""
+
+    def _finish(ok, note, got_vod):
+        if site is not None:
+            site["_latency_ms"] = int(round((time.time() - t0) * 1000))
+            site["_probe_kind"] = "vod" if got_vod else ("empty" if ok else "fail")
+        return ok, note, got_vod
+
     for idx, kw in enumerate(kws):
         ok, note, kind = _probe_http(api, kw, cfg)
         if kind == "vod" and ok:
-            return True, note, True
+            return _finish(True, note, True)
         if kind == "empty" and ok:
             empty_notes.append(note)
             continue
@@ -729,14 +738,14 @@ def probe_http_api(api, cfg):
     # 多关键词都只返回标准空结果
     if empty_notes and not bad_notes:
         if cfg.get("content_strict", False):
-            return False, "多关键词均为空结果(严格模式)", False
+            return _finish(False, "多关键词均为空结果(严格模式)", False)
         if cfg.get("allow_empty_result", True):
-            return True, "存活(换词仍空结果，源结构正常)", False
-        return False, "多关键词均为空结果(未允许)", False
+            return _finish(True, "存活(换词仍空结果，源结构正常)", False)
+        return _finish(False, "多关键词均为空结果(未允许)", False)
     # 有真视频已被上面的 return 捕获；剩下是失败（可能部分词空、部分失败）
     if empty_notes and cfg.get("allow_empty_result", True) and not cfg.get("content_strict", False):
-        return True, "存活(部分关键词空结果)", False
-    return False, (first_err or "多关键词均未拿到有效视频"), False
+        return _finish(True, "存活(部分关键词空结果)", False)
+    return _finish(False, (first_err or "多关键词均未拿到有效视频"), False)
 
 
 # —— 爬虫源（csp_ / .js）：从脚本还原真实接口 + 依赖可达性兜底 ——
@@ -842,21 +851,23 @@ def probe_spider_site(site, cfg):
     if cfg.get("spider_extract_api", True):
         for u, script in loaded:
             for real_api in extract_api_from_script(script, cfg):
-                ok, note, got_vod = probe_http_api(real_api, cfg)
+                ok, note, got_vod = probe_http_api(real_api, cfg, site=site)
                 if ok and got_vod:
                     site["api"] = real_api
                     site["_restored_from"] = api
                     return True, "爬虫源·接口还原有效(%s): %s" % (u.rsplit("/", 1)[-1][:20], note)
 
-    # 策略 2：依赖可达即保留
+    # 策略 2：依赖可达即保留（未测真实内容，速度不可比，排序时降到最后）
     if loaded:
         u = loaded[0][0]
         site["_crawler"] = True
+        site["_probe_kind"] = "crawler"
         return True, "爬虫源·依赖可达未测内容(%s)" % u.rsplit("/", 1)[-1][:24]
 
     # 站点带 spider 包字段，但脚本取不到（可能站点本身即标识）
     if api.startswith("csp_") and cfg.get("spider_keep_if_unreachable", True):
         site["_crawler"] = True
+        site["_probe_kind"] = "crawler"
         return True, "爬虫源·依赖未取到(csp包)，按配置保留"
 
     if candidates:
@@ -869,13 +880,24 @@ def probe_site(site, cfg):
 
     http api：多关键词测活 + 网络抖动重试（见 probe_http_api / http_get）
     非 http：csp/js 爬虫源走接口还原 + 依赖可达兜底（见 probe_spider_site）
+
+    副作用：向 site 写入 _latency_ms(响应耗时ms) 与 _probe_kind
+    （vod 拿到真实视频 / empty 空结果 / crawler 爬虫源未测内容 / fail 失败），
+    供订阅按「速度从高到低」排序使用。返回签名不变，checker.py 可继续复用。
     """
+    site["_latency_ms"] = 0
+    site["_probe_kind"] = "fail"
     api = site.get("api") or site.get("url") or ""
     if not api:
         return False, "无 api"
     if not api.startswith(("http://", "https://")):
-        return probe_spider_site(site, cfg)
-    ok, note, _ = probe_http_api(api, cfg)
+        t0 = time.time()
+        ok, note = probe_spider_site(site, cfg)
+        # 爬虫源的耗时含脚本下载，不代表视频接入速度；记录但排序时降到最后
+        if not site.get("_latency_ms"):
+            site["_latency_ms"] = int(round((time.time() - t0) * 1000))
+        return ok, note
+    ok, note, _ = probe_http_api(api, cfg, site=site)
     return ok, note
 
 
@@ -896,6 +918,29 @@ def dedupe_sites(sites):
     return out
 
 
+def speed_sort_key(site):
+    """速度排序键：拿到真视频 > 空结果 > 爬虫源未测内容；同级按响应耗时升序。
+
+    TVBox 展示订阅时逐个加载站点，响应越快的站体验越流畅。爬虫源没有测过
+    真实视频接入速度（只验证了依赖可达），因此排在最后，不占用快速名额。
+    """
+    kind = site.get("_probe_kind", "")
+    if kind == "vod":
+        tier = 0
+    elif kind == "empty":
+        tier = 1
+    elif kind == "crawler":
+        tier = 2
+    else:
+        tier = 3
+    return (tier, int(site.get("_latency_ms", 0)))
+
+
+def sort_sites_by_speed(sites):
+    """按接入速度从高到低排序（真视频优先、耗时小者优先）。"""
+    return sorted(sites, key=speed_sort_key)
+
+
 def build_base_config(leaves, cfg):
     """以第一个有效单仓配置为模板，按需保留 lives/parses。"""
     base = {}
@@ -910,89 +955,123 @@ def build_base_config(leaves, cfg):
     return base
 
 
-def merge_subscription(leaves, alive_sites, cfg):
-    """生成订阅。mark + adult_separate 模式下把成人站点拆到单独订阅。
+def _clean_site_for_output(s, cfg):
+    """清理站点的内部字段并加标注（脱敏/爬虫标记），返回 (站点, 是否成人, 是否爬虫, 是否还原)。"""
+    mode = adult_mode(cfg)
+    is_ad = bool(s.pop("_adult", False)) and mode == "mark"
+    is_crawler = bool(s.pop("_crawler", False))
+    restored = bool(s.pop("_restored_from", None))
+    s.pop("_source", None)
+    s.pop("_sources", None)
+    s.pop("_source_url", None)
+    s.pop("_leaf_spider", None)
+    s.pop("_latency_ms", None)   # 速度数据不写进订阅文件
+    s.pop("_probe_kind", None)
+    if is_ad:
+        s["name"] = mark_adult_name(s.get("name", ""), cfg)
+    # 爬虫源在名称前加标注，便于在影视仓里识别（接口已还原的不标）。
+    # 放在成人脱敏之后，避免成人站的 1BJ 代号覆盖掉爬虫标注。
+    crawler_tag = cfg.get("crawler_name_tag", "[爬]")
+    if is_crawler and not restored and crawler_tag:
+        nm = str(s.get("name", ""))
+        if crawler_tag not in nm:
+            s["name"] = crawler_tag + nm
+    return s, is_ad, is_crawler, restored
 
-    返回 (主订阅, 成人订阅或None, 成人站点数)。
-    - 主订阅 output/subscribe.json：只含常规站点（成人站点已移出）
-    - 成人订阅 output/subscribe_adult.json：只含带 🔞 标注的成人站点
-    - adult_separate=False 时不拆分，成人站点仍留在主订阅（带标注）
+
+def _make_sub(base, sites, cfg, placement, stamp, extra=None):
+    """按统一模板构造一个订阅对象。"""
+    mode = adult_mode(cfg)
+    sub = dict(base)
+    sub["sites"] = sites
+    notes = {
+        "separate": "成人站点已拆分至单独订阅",
+        "mix": "成人站点带标注混排",
+        "report_only": "成人站点仅在报告展示，未写入订阅",
+        "all": "全量存活站点（按接入速度从高到低排序）",
+    }
+    info = {
+        "updated": stamp,
+        "site_count": len(sites),
+        "adult_mode": mode,
+        "adult_placement": placement,
+        "note": notes.get(placement, ""),
+    }
+    if extra:
+        info.update(extra)
+    sub["_maintainer"] = info
+    return sub
+
+
+def merge_subscription(leaves, alive_sites, cfg):
+    """生成三份订阅：主订阅(Top N)、全量订阅、成人订阅。
+
+    alive_sites 需已按速度排序（sort_sites_by_speed）。
+    返回 (主订阅, 全量订阅, 成人订阅或None, 成人站点数)。
+    - 主订阅 output/subscribe.json：常规站点里速度最快的前 main_top_n 个（默认60）
+    - 全量订阅 output/subscribe_all.json：全部常规存活站点，按速度排序
+    - 成人订阅 output/subscribe_adult.json：带 🔞 标注的成人站点（不受 Top N 限制）
     """
     mode = adult_mode(cfg)
     placement = adult_placement(cfg) if mode == "mark" else "mix"
-    separate = placement == "separate"
     base = build_base_config(leaves, cfg)
 
     normal_sites, adult_sites = [], []
     for s in alive_sites:
-        is_ad = bool(s.pop("_adult", False)) and mode == "mark"
-        is_crawler = bool(s.pop("_crawler", False))
-        restored = bool(s.pop("_restored_from", None))
-        s.pop("_source", None)
-        s.pop("_sources", None)
-        s.pop("_source_url", None)
-        s.pop("_leaf_spider", None)
+        cleaned, is_ad, _is_crawler, _restored = _clean_site_for_output(s, cfg)
         if is_ad:
-            s["name"] = mark_adult_name(s.get("name", ""), cfg)
-        # 爬虫源在名称前加标注，便于在影视仓里识别（接口已还原的不标）。
-        # 放在成人脱敏之后，避免成人站的 1BJ 代号覆盖掉爬虫标注。
-        crawler_tag = cfg.get("crawler_name_tag", "[爬]")
-        if is_crawler and not restored and crawler_tag:
-            nm = str(s.get("name", ""))
-            if crawler_tag not in nm:
-                s["name"] = crawler_tag + nm
-        if is_ad:
-            adult_sites.append(s)
+            adult_sites.append(cleaned)
         else:
-            normal_sites.append(s)
+            normal_sites.append(cleaned)
 
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    main_sub = dict(base)
-    main_sub["sites"] = normal_sites
-    place_notes = {
-        "separate": "成人站点已拆分至单独订阅",
-        "mix": "成人站点带标注混排",
-        "report_only": "成人站点仅在报告展示，未写入订阅",
-    }
-    main_sub["_maintainer"] = {
-        "updated": stamp,
-        "alive_sites": len(normal_sites),
-        "adult_mode": mode,
-        "adult_placement": placement,
-        "note": place_notes[placement],
-    }
+    # 全量订阅：所有常规站点，按传入顺序（已按速度排序）
+    full_sub = _make_sub(base, normal_sites, cfg, "all", stamp,
+                         {"total_before_top": len(normal_sites)})
+    # 主订阅：Top N
+    top_n = int(cfg.get("main_top_n", 60) or 0)
+    top_sites = normal_sites[:top_n] if top_n > 0 else list(normal_sites)
+    main_sub = _make_sub(base, top_sites, cfg, placement, stamp,
+                         {"top_n": top_n if top_n > 0 else None,
+                          "full_site_count": len(normal_sites)})
 
     if placement == "separate":
-        adult_sub = dict(base)
-        adult_sub["sites"] = adult_sites
-        adult_sub["_maintainer"] = {
-            "updated": stamp,
-            "alive_sites": len(adult_sites),
-            "adult_mode": mode,
-            "adult_only": True,
-        }
-        return main_sub, adult_sub, len(adult_sites)
+        adult_sub = _make_sub(base, adult_sites, cfg, "separate", stamp,
+                              {"adult_only": True})
+        return main_sub, full_sub, adult_sub, len(adult_sites)
 
     if placement == "mix":
-        # 混排：成人站点仍留在主订阅（带标注）
-        main_sub["sites"] = normal_sites + adult_sites
-        main_sub["_maintainer"]["alive_sites"] = len(normal_sites) + len(adult_sites)
-        main_sub["_maintainer"]["adult_marked"] = len(adult_sites)
+        # 混排：主订阅与全量订阅都把成人站点带标注混排进来（同样 Top N 限制）
+        # 站点已在 _clean_site_for_output 前按速度排好，这里直接拼接即可
+        mixed = normal_sites + adult_sites
+        main_sub = _make_sub(base, mixed[:top_n] if top_n > 0 else mixed,
+                             cfg, "mix", stamp, {"adult_marked": len(adult_sites)})
+        full_sub = _make_sub(base, mixed, cfg, "all", stamp, {"adult_marked": len(adult_sites)})
+        return main_sub, full_sub, None, len(adult_sites)
 
     # report_only：成人站点不写入任何订阅，仅在报告展示
-    return main_sub, None, len(adult_sites)
+    return main_sub, full_sub, None, len(adult_sites)
 
 
-def write_output(cfg, subscription, report_lines, adult_subscription=None):
+def write_output(cfg, subscription, report_lines, adult_subscription=None, full_subscription=None):
     def resolve(p):
         return p if os.path.isabs(p) else os.path.join(BASE_DIR, p)
 
-    # 主订阅
+    # 主订阅（Top N）
     p = resolve(cfg["output"])
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         json.dump(subscription, f, ensure_ascii=False, indent=2)
     log("已写出主订阅: %s (%d 站)" % (cfg["output"], len(subscription.get("sites", []))))
+
+    # 全量订阅（所有存活站，按速度排序）
+    all_path = cfg.get("all_output", "output/subscribe_all.json")
+    if full_subscription is not None:
+        ap = resolve(all_path)
+        os.makedirs(os.path.dirname(ap), exist_ok=True)
+        with open(ap, "w", encoding="utf-8") as f:
+            json.dump(full_subscription, f, ensure_ascii=False, indent=2)
+        log("已写出全量订阅: %s (%d 站)" % (all_path, len(full_subscription.get("sites", []))))
 
     # 成人订阅（单独存放）
     adult_path = cfg.get("adult_output", "output/subscribe_adult.json")
@@ -1089,6 +1168,7 @@ def main():
                 log("测活进度 %d/%d，当前存活 %d" % (i, total, len(alive)))
 
     alive = dedupe_sites(alive)
+    alive = sort_sites_by_speed(alive)   # 按接入速度从高到低排序
     # 成人站点明细（在 merge_subscription 清除标记之前生成）
     # adult_all_details: 所有识别到的成人站点（含失效），保留完整网址
     # adult_alive_details: 其中通过测活的
@@ -1110,7 +1190,28 @@ def main():
     report.append("- 其中成人内容存活(已标注): %d" % len(adult_alive_details))
     report.append("- 其中爬虫源保留: %d（接口还原有效 %d / 依赖可达待验证 %d）" % (
         len(crawler_alive), len(crawler_restored), len(crawler_alive) - len(crawler_restored)))
+
+    top_n = int(cfg.get("main_top_n", 60) or 0)
+    normal_alive = [s for s in alive if not s.get("_adult")]
+    main_count = min(top_n, len(normal_alive)) if top_n > 0 else len(normal_alive)
+    report.append("- 主订阅(展示用): 速度最快的前 %d 站（常规存活 %d 站）" % (main_count, len(normal_alive)))
+    report.append("- 全量订阅: 全部 %d 站，按接入速度从高到低排序" % len(normal_alive))
     report.append("")
+
+    # 速度排行榜：主订阅入选的快速站点
+    if cfg.get("speed_report", True):
+        report.append("## 最快站点 Top %d（主订阅入选，按响应耗时升序）" % main_count)
+        report.append("")
+        report.append("| 排名 | 站点 | 响应耗时 | 测活结果 | 网址(api) |")
+        report.append("| --- | --- | --- | --- | --- |")
+        for rank, s in enumerate(normal_alive[:main_count], 1):
+            lat = s.get("_latency_ms", 0)
+            kind = s.get("_probe_kind", "")
+            kind_label = {"vod": "有效视频", "empty": "空结果", "crawler": "爬虫未测内容"}.get(kind, kind or "-")
+            disp = mark_adult_name(s.get("name", "?"), cfg) if s.get("_adult") else s.get("name", "?")
+            report.append("| %d | %s | %d ms | %s | %s |" % (
+                rank, md_cell(disp), lat, kind_label, md_cell(s.get("api", ""))))
+        report.append("")
 
     # 成人内容清单：名称 + 网址 + 来源仓（用户要求标注出来并给出网址）
     # 列出所有识别到的成人站点（存活 + 失效），确保网址一定能看到
@@ -1141,10 +1242,11 @@ def main():
         report.append("| %s | %s | %s | %s | %s |" % (
             "存活" if ok else "失效", md_cell(disp), md_cell(api), md_cell(src), md_cell(why)))
 
-    # 3) 生成订阅（成人站点按 adult_placement 拆分/混排/仅报告）
-    subscription, adult_subscription, adult_alive = merge_subscription(leaves, alive, cfg)
+    # 3) 生成订阅（主订阅Top N + 全量订阅 + 成人订阅）
+    subscription, full_subscription, adult_subscription, adult_alive = merge_subscription(leaves, alive, cfg)
     placement = adult_placement(cfg) if amode == "mark" else "exclude"
     adult_path = cfg.get("adult_output", "output/subscribe_adult.json")
+    all_path = cfg.get("all_output", "output/subscribe_all.json")
     place_desc = {
         "separate": "拆分至单独订阅 %s" % adult_path,
         "mix": "带标注混排进主订阅 %s" % cfg["output"],
@@ -1152,7 +1254,8 @@ def main():
         "exclude": "已过滤",
     }[placement]
     report.insert(3, "- 成人站点去向: %s（共 %d 个存活）" % (place_desc, adult_alive))
-    write_output(cfg, subscription, report, adult_subscription)
+    report.insert(4, "- 订阅文件: 主订阅(Top N) %s；全量订阅 %s" % (cfg["output"], all_path))
+    write_output(cfg, subscription, report, adult_subscription, full_subscription)
     log("完成。")
     return 0 if alive else 2
 
