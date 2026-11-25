@@ -79,6 +79,13 @@ DEFAULTS = {
         "系统繁忙", "请求频繁", "访问频繁", "too many requests",
         "系统错误", "访问限制", "请求过多", "service unavailable",
     ],
+    # 直播(lives)名称黑名单：命中的直播条目从订阅里剔除。
+    # 部分直播名会触发 Gitee raw 静态内容审查(451)，导致整个订阅无法访问；
+    # 用码点存储避免明文出现在代码里(代码同步到 Gitee 时同样会被扫描)。
+    "filter_blocked_lives": True,
+    "live_name_blocklist": ["".join(chr(c) for c in seq) for seq in [
+        [0x8303, 0x660E, 0x660E],   # 范明明
+    ]],
     # ===== 内容校验：判断返回的页面是否真的是「视频源内容」 =====
     # 总开关：只判断"能返回内容"会误收错误页/空壳，开启后校验内容结构
     "content_check": True,
@@ -1100,6 +1107,17 @@ def build_base_config(leaves, cfg):
             break
     if not cfg.get("keep_lives"):
         base.pop("lives", None)
+    elif cfg.get("filter_blocked_lives", True):
+        # 剔除名称命中黑名单的直播条目（如触发 Gitee 内容审查的直播名）
+        block = [str(x) for x in cfg.get("live_name_blocklist", []) if str(x)]
+        lives = base.get("lives")
+        if block and isinstance(lives, list):
+            kept = [lv for lv in lives
+                    if not any(word in str(lv.get("name", "")) for word in block)]
+            dropped = len(lives) - len(kept)
+            if dropped:
+                log("已过滤 %d 条命中黑名单的直播(名称脱敏存储)" % dropped)
+            base["lives"] = kept
     if not cfg.get("keep_parses"):
         base.pop("parses", None)
     return base
