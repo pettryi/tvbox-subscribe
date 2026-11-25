@@ -103,19 +103,19 @@ sources.txt 行数: 45
 
 ## 六、影视仓订阅地址
 
-运行成功后，订阅文件在：
+运行成功后，会生成**两份订阅**，按需选用（站点太多会让 TVBox/影视仓打开卡顿，所以默认推荐主订阅）：
 
-```
-https://raw.githubusercontent.com/你的用户名/你的仓库名/main/output/subscribe.json
-```
+| 订阅 | 说明 | 地址（pettry 仓库示例） |
+| --- | --- | --- |
+| **主订阅（推荐）** | 按接入速度从高到低排序，只保留最快的 **60 个**站点（数量可在 `config.json` 的 `main_top_n` 修改）；打开流畅不卡死 | `https://raw.githubusercontent.com/pettryi/tvbox-subscribe/main/output/subscribe.json` |
+| **全量订阅** | 全部通过测活的站点，同样按速度排序，站点多、内容丰富但加载较慢 | `https://raw.githubusercontent.com/pettryi/tvbox-subscribe/main/output/subscribe_all.json` |
+| **成人订阅** | 独立仓库，仅 `subscribe.json`，站点名已脱敏为 `1BJ` | `https://raw.githubusercontent.com/pettryi/tvbox-subscribe-adult/main/subscribe.json` |
 
-例如：
+把想要的那个链接填进影视仓的「配置地址」即可。
 
-```
-https://raw.githubusercontent.com/pettry/tvbox-subscribe/main/output/subscribe.json
-```
+**速度排序规则**：每天定时对所有站点重新测活并记录响应耗时，按「拿到真实视频 → 空结果 → 爬虫源未测内容」分层、同层按耗时从小到大排序。主订阅取排在最前的 60 个；完整排行可在每次运行的 Summary 报告里查看。
 
-把这个链接填进影视仓的「配置地址」即可。
+> 想订阅全部站点就用全量订阅；日常流畅使用用主订阅。两份地址由同一份数据每天自动更新。
 
 ---
 
@@ -176,7 +176,8 @@ https://raw.githubusercontent.com/pettry/tvbox-subscribe/main/output/subscribe.j
 | `config.json` | 运行参数（超时、并发、成人处理等） |
 | `sources.txt` | 空占位模板，真实源通过 Secrets 注入 |
 | `真实源BASE64-填Secrets用.txt` | 真实源的 Base64，**仅用于填 Secrets，不要上传仓库**（已在 .gitignore 排除） |
-| `output/subscribe.json` | 主订阅，已预置线上验证过的 84 站数据，上传后影视仓立即可用；之后由定时任务自动更新 |
+| `output/subscribe.json` | 主订阅（Top 60），按接入速度排序的最快 60 站，影视仓填此地址流畅不卡；由定时任务自动更新 |
+| `output/subscribe_all.json` | 全量订阅，全部存活站按速度排序；站点多但加载较慢，按需选用 |
 | `check.py` / `web_check.py` | 本地手动测活工具 |
 | `discover.py` | 从种子渠道发现新候选源 |
 
