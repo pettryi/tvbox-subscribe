@@ -907,7 +907,7 @@ def probe_spider_site(site, cfg):
         if txt:
             loaded.append((u, txt))
 
-    # 策略 1：真实接口还原
+    # 策略 1：真实接口还原（唯一能确认影视仓可加载的方式）
     if cfg.get("spider_extract_api", True):
         for u, script in loaded:
             for real_api in extract_api_from_script(script, cfg):
@@ -917,6 +917,18 @@ def probe_spider_site(site, cfg):
                     site["_restored_from"] = api
                     return True, "爬虫源·接口还原有效(%s): %s" % (u.rsplit("/", 1)[-1][:20], note)
 
+    # 严格模式：只保留「接口还原并测到真视频」的爬虫源。
+    # 影视仓加载 csp/js 源必须先下载 jar/js 并执行采集规则；jar 多为相对路径、
+    # 规则普遍失效，仅验证「依赖可达」或「csp 占位」的源在影视仓里几乎都是空白主页。
+    # 这类空壳不剔除会污染全量订阅，故默认严格，直接判失效。
+    if cfg.get("spider_strict", True):
+        if loaded:
+            return False, "爬虫源·接口还原失败(仅依赖可达，影视仓多为空内容)，已剔除"
+        if api.startswith("csp_"):
+            return False, "爬虫源·接口还原失败(csp占位无可用脚本)，已剔除"
+        return False, "爬虫源·接口还原失败(脚本不可达)，已剔除"
+
+    # —— 以下为宽松模式（spider_strict=false）的历史兜底，保留旧行为 ——
     # 策略 2：依赖可达即保留（未测真实内容，速度不可比，排序时降到最后）
     if loaded:
         u = loaded[0][0]
@@ -1041,15 +1053,40 @@ def main_rank_key(site):
     return (tier, int(site.get("_latency_ms", 0) or 0))
 
 
+def _has_spider_dependency(site):
+    """站点是否需要 spider 解析包才能列出首页内容（影视仓会显示空白主页）。
+
+    关键区分：很多正常 JSON CMS 站(type=1, api.php/provide/vod/)也附带 spider
+    字段，但那只是播放解析用，首页列表不依赖它，影视仓能正常显示——不能误伤。
+    真正的空内容源只有两类：
+      1) csp_/js 爬虫源（type=3），必须执行 jar/js 才能出内容；
+      2) XML 采集接口（api 含 at/xml、seaxml、/xml/），影视仓多按 JSON 解析，
+         拿到 XML 解析失败 → 空白主页（用户实测「分享异果」即此类）。
+    """
+    api = str(site.get("api") or site.get("url") or "").lower()
+    if api.startswith("csp_") or api.startswith("js"):
+        return True
+    # type=3 爬虫源（即使 api 看似 http，也依赖 spider 执行）
+    if str(site.get("type")) == "3":
+        return True
+    # XML 采集接口
+    if "at/xml" in api or "seaxml" in api or api.endswith("/xml/") or api.endswith("/xml"):
+        return True
+    return False
+
+
 def pick_main_sites(alive_sites, cfg, include_adult=False):
     """从全部存活站里选出主订阅候选。
 
     先按 main_rank_key 分层排序（影视仓可见站优先），再取前 main_top_n 个。
     存活站不足 top_n 时有多少取多少。默认只在非成人站中选（成人单独订阅）。
+    main_exclude_spider=true 时排除依赖 spider 解析包的站（影视仓多为空主页）。
     返回 (完整分层排序列表, Top N 列表)，均为站点对象引用（尚未清理内部字段）。
     """
     top_n = int(cfg.get("main_top_n", 60) or 0)
     pool = [s for s in alive_sites if include_adult or not s.get("_adult")]
+    if cfg.get("main_exclude_spider", True):
+        pool = [s for s in pool if not _has_spider_dependency(s)]
     ranked = sorted(pool, key=main_rank_key)
     return ranked, (ranked[:top_n] if top_n > 0 else list(ranked))
 
@@ -1336,9 +1373,12 @@ def main():
                 if (not s.get("_home_visible")) and s.get("_probe_kind") == "vod")
     n_empty = sum(1 for s in main_selected if s.get("_probe_kind") == "empty")
     n_crawler = main_count - n_visible - n_vod - n_empty
+    excluded_spider = sum(1 for s in normal_alive if _has_spider_dependency(s)) if cfg.get("main_exclude_spider", True) else 0
     report.append("- 影视仓可见站(列表接口验证有视频): %d 站" % len(home_pool))
     report.append("- 主订阅(展示用): 补足至 %d 站（可见真视频 %d + 搜索真视频 %d + 空结果 %d + 其他 %d；常规存活 %d）" % (
         main_count, n_visible, n_vod, n_empty, n_crawler, len(normal_alive)))
+    if cfg.get("main_exclude_spider", True):
+        report.append("- 主订阅已排除 spider 依赖站: %d 个（jar/zip/js 包或 XML 接口，影视仓多显示空白主页）" % excluded_spider)
     report.append("- 全量订阅: 全部 %d 站，按接入速度从高到低排序" % len(normal_alive))
     report.append("")
 
