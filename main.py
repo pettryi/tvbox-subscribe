@@ -170,29 +170,49 @@ def normalize_url(url):
         return url
 
 
+def alt_scheme(url):
+    """返回切换 http/https 后的地址，无法切换时返回空串。"""
+    if url.startswith("http://"):
+        return "https://" + url[len("http://"):]
+    if url.startswith("https://"):
+        return "http://" + url[len("https://"):]
+    return ""
+
+
 def http_get(url, cfg, timeout=None):
-    """返回 (text, status, error)。出错时 text 为 None。"""
+    """返回 (text, status, error)。出错时 text 为 None。
+
+    抗抖动：每次重试轮换 UA；纯网络错误（超时/DNS/连接重置）时自动尝试
+    切换 http/https 再试一次，避免单线路故障把有效源误判为失效。
+    HTTP 4xx/5xx 属于服务端明确响应，不做协议切换。
+    """
     timeout = timeout or cfg["timeout"]
-    ua = random.choice(UA_POOL) if cfg.get("ua_rotate") else cfg["user_agent"]
-    # 中文域名/路径先做 IDNA + 百分号编码，避免 ascii 编码异常
     url = normalize_url(url)
-    req = urllib.request.Request(url, headers={
-        "User-Agent": ua,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-    })
+    retries = int(cfg.get("retries", 0))
     opener, _ = make_opener(timeout)
     last_err = None
-    for attempt in range(int(cfg.get("retries", 0)) + 1):
+    tried = set()
+
+    def do_request(target):
+        ua = random.choice(UA_POOL) if cfg.get("ua_rotate") else cfg["user_agent"]
+        req = urllib.request.Request(normalize_url(target), headers={
+            "User-Agent": ua,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        })
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read()
+            charset = resp.headers.get_content_charset() or "utf-8"
+            try:
+                text = raw.decode(charset, errors="replace")
+            except LookupError:
+                text = raw.decode("utf-8", errors="replace")
+            return text, resp.status, None
+
+    target = url
+    for attempt in range(retries + 1):
         try:
-            with opener.open(req, timeout=timeout) as resp:
-                raw = resp.read()
-                charset = resp.headers.get_content_charset() or "utf-8"
-                try:
-                    text = raw.decode(charset, errors="replace")
-                except LookupError:
-                    text = raw.decode("utf-8", errors="replace")
-                return text, resp.status, None
+            return do_request(target)
         except urllib.error.HTTPError as e:
             last_err = "HTTP %s" % e.code
             try:
@@ -202,7 +222,15 @@ def http_get(url, cfg, timeout=None):
                 pass
         except Exception as e:
             last_err = str(e)
-        if attempt < int(cfg.get("retries", 0)):
+            # 纯网络错误：尝试切换协议再要一次（只切一次）
+            if cfg.get("probe_scheme_fallback", True):
+                alt = alt_scheme(target)
+                if alt and alt not in tried:
+                    tried.add(target)
+                    target = alt
+                    last_err = str(e) + " (重试切换协议)"
+                    continue
+        if attempt < retries:
             time.sleep(0.3 * (attempt + 1))
     return None, 0, last_err
 
@@ -430,7 +458,15 @@ def expand_sources(sources, cfg):
             filtered[0] += 1  # 两种模式都统计识别到的成人仓
             logs.append((depth, url, name, "成人仓(标注展开)" if mode == "mark" else "成人仓"))
         if isinstance(data.get("sites"), list):
-            # 叶子单仓
+            # 叶子单仓：把 spider 包地址补进每个站点，供爬虫源测活使用
+            spider_url = data.get("spider") or ""
+            for st in data["sites"]:
+                if isinstance(st, dict):
+                    # 站点未显式给 spider 时，继承仓级 spider 字段
+                    if not (st.get("spider") or st.get("spiderUrl")) and spider_url:
+                        st.setdefault("_leaf_spider", spider_url)
+                        if isinstance(spider_url, str):
+                            st["spider"] = spider_url
             tag = " [成人]" if adult_here else ""
             logs.append((depth, url, name, "单仓 %d 站%s" % (len(data["sites"]), tag)))
             leaves.append({"url": url, "name": name, "config": data, "adult": adult_here})
@@ -491,6 +527,8 @@ def collect_sites(leaves, cfg):
             item = dict(s)
             item["_source"] = src
             item["_sources"] = [src]
+            # 记录叶子配置地址，供爬虫源解析 ./ext/xxx.js 这类相对路径
+            item["_source_url"] = leaf.get("url", "")
             if is_ad and mode == "mark":
                 item["_adult"] = True
             if key:
@@ -614,44 +652,231 @@ def classify_content(body, cfg):
     return "invalid", "非视频源内容(%d 字节)" % len(text)
 
 
-def probe_site(site, cfg):
-    """测活单个站点，返回 (是否存活, 说明)。"""
-    api = site.get("api") or site.get("url") or ""
-    if not api or not api.startswith(("http://", "https://")):
-        return False, "无有效 api"
-    url = build_probe_url(api, cfg["keyword"])
+def _probe_http(api, keyword, cfg):
+    """用单个关键词探测一个 http api，返回 (ok, note, kind)。
+
+    kind: 'vod' 真视频 / 'empty' 标准空结果 / 'invalid' 内容无效 /
+          'error' 网络或请求失败。ok 仅代表本次请求拿到可用响应。
+    """
+    url = build_probe_url(api, keyword)
     text, status, err = http_get(url, cfg)
     if err or text is None:
-        return False, err or "请求失败"
+        return False, err or "请求失败", "error"
     body = text.strip()
     if len(body) < int(cfg.get("min_body", 20)):
-        return False, "响应过短(status=%s)" % status
+        return False, "响应过短(status=%s)" % status, "error"
     lower = body.lower()
     for bad in cfg.get("bad_keywords", []):
         if bad.lower() in lower:
-            return False, "命中异常关键词: %s" % bad
+            return False, "命中异常关键词: %s" % bad, "error"
 
-    # 内容校验：判断返回的是否真是视频源
     if cfg.get("content_check", True):
         kind, note = classify_content(body, cfg)
-        if kind == "invalid":
-            return False, "内容校验失败: " + note
+        if kind == "vod":
+            return True, "有效视频源: " + note, "vod"
         if kind == "empty":
-            return True, "存活(空结果): " + note
-        return True, "有效视频源: " + note
+            return True, "标准空结果: " + note, "empty"
+        return False, "内容校验失败: " + note, "invalid"
 
     # —— 关闭内容校验时的旧逻辑（仅判断能否返回）——
     data = parse_json_loose(body)
     if data is not None:
         if isinstance(data, list):
-            return (len(data) > 0), ("返回 %d 条" % len(data) if data else "空列表")
+            return (len(data) > 0), ("返回 %d 条" % len(data) if data else "空列表"), "vod"
         if isinstance(data, dict):
             for k in ("list", "data", "result", "videos", "results"):
                 v = data.get(k)
                 if isinstance(v, list):
-                    return (len(v) > 0), ("%s: %d 条" % (k, len(v)) if v else "%s 空" % k)
-            return True, "返回对象(%d 字段)" % len(data)
-    return True, "非 JSON 响应(%d 字节)" % len(body)
+                    return (len(v) > 0), ("%s: %d 条" % (k, len(v)) if v else "%s 空" % k), "vod"
+            return True, "返回对象(%d 字段)" % len(data), "vod"
+    return True, "非 JSON 响应(%d 字节)" % len(body), "vod"
+
+
+def probe_http_api(api, cfg):
+    """对一个 http api 用「多关键词」测活（换词后再判）。
+
+    返回 (是否存活, 说明, 是否曾拿到真实视频)。
+    - 任一关键词拿到真视频条目 -> 存活
+    - 全部关键词都只是标准空结果 -> 由 allow_empty_result / content_strict 决定
+    - 否则失效
+    """
+    kws = [cfg.get("keyword", "test")]
+    for k in cfg.get("probe_keywords", []) or []:
+        if k and k not in kws:
+            kws.append(k)
+    limit = int(cfg.get("probe_keyword_limit", 3))
+    kws = kws[:max(1, limit)]
+
+    empty_notes, bad_notes, first_err = [], [], ""
+    for idx, kw in enumerate(kws):
+        ok, note, kind = _probe_http(api, kw, cfg)
+        if kind == "vod" and ok:
+            return True, note, True
+        if kind == "empty" and ok:
+            empty_notes.append(note)
+            continue
+        # 网络错误（超时/DNS/连接失败）：换关键词改变不了网络可达性，
+        # 直接判定，避免每个失效站点都空等 N 次超时拖垮整体耗时
+        if kind == "error":
+            if not first_err:
+                first_err = note
+            bad_notes.append("%s:%s" % (kw, note[:24]))
+            break
+        if not first_err:
+            first_err = note
+        bad_notes.append("%s:%s" % (kw, note[:24]))
+
+    # 多关键词都只返回标准空结果
+    if empty_notes and not bad_notes:
+        if cfg.get("content_strict", False):
+            return False, "多关键词均为空结果(严格模式)", False
+        if cfg.get("allow_empty_result", True):
+            return True, "存活(换词仍空结果，源结构正常)", False
+        return False, "多关键词均为空结果(未允许)", False
+    # 有真视频已被上面的 return 捕获；剩下是失败（可能部分词空、部分失败）
+    if empty_notes and cfg.get("allow_empty_result", True) and not cfg.get("content_strict", False):
+        return True, "存活(部分关键词空结果)", False
+    return False, (first_err or "多关键词均未拿到有效视频"), False
+
+
+# —— 爬虫源（csp_ / .js）：从脚本还原真实接口 + 依赖可达性兜底 ——
+_SCRIPT_CACHE = {}
+
+
+def _load_script(url, cfg):
+    """下载爬虫脚本/jar 文本，带缓存与大小上限。返回 (text, err)。"""
+    url = (url or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return "", "非 http 脚本地址"
+    if url in _SCRIPT_CACHE:
+        return _SCRIPT_CACHE[url]
+    max_bytes = int(cfg.get("spider_max_bytes", 4 * 1024 * 1024))
+    text, status, err = http_get(url, cfg, timeout=int(cfg.get("spider_timeout", 10)))
+    if err or text is None:
+        _SCRIPT_CACHE[url] = ("", err or "status=%s" % status)
+    elif len(text) > max_bytes:
+        _SCRIPT_CACHE[url] = ("", "脚本过大(%d字节)" % len(text))
+    else:
+        _SCRIPT_CACHE[url] = (text, None)
+    return _SCRIPT_CACHE[url]
+
+
+def extract_api_from_script(script, cfg):
+    """从 csp/js 爬虫脚本里提取可能的真实视频接口地址。
+
+    csp_/drpy 脚本内部通常写死了真实 CMS 接口（api.php/provide/vod、
+    https://域名/api.php/vod 等）。用正则把这些地址抠出来再交给普通测活。
+    返回去重后的候选 api 列表。
+    """
+    if not script:
+        return []
+    pats = cfg.get("spider_api_patterns", [
+        r"https?://[^\s\"'<>{}|,;\\`\)\(]+?/api\.php/provide/vod[^\s\"'<>{}|,;\\`\)\(]*",
+        r"https?://[^\s\"'<>{}|,;\\`\)\(]+?/api\.php/vod[^\s\"'<>{}|,;\\`\)\(]*",
+        r"https?://[^\s\"'<>{}|,;\\`\)\(]+?/api\.php[^\s\"'<>{}|,;\\`\)\(]*",
+        r"https?://[^\s\"'<>{}|,;\\`\)\(]+?/provide/vod[^\s\"'<>{}|,;\\`\)\(]*",
+    ])
+    found = []
+    for p in pats:
+        try:
+            found.extend(re.findall(p, script, flags=re.I))
+        except re.error:
+            continue
+    out, seen = [], set()
+    for u in found:
+        u = u.rstrip("/.,;)]}")
+        u = u.replace("\\/", "/").replace("&amp;", "&")
+        if len(u) < 12 or u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+        if len(out) >= int(cfg.get("spider_api_max", 8)):
+            break
+    return out
+
+
+def probe_spider_site(site, cfg):
+    """测活非 http 的爬虫源（csp_ / .js 等）。返回 (是否保留, 说明)。
+
+    两级策略：
+      1) 依赖可达：站点 ext / spider 字段里的脚本能下载 -> 视为"待验证爬虫源"保留
+      2) 真实接口还原：从脚本里抠出 http api，用普通测活验证 -> 确认为有效源
+    两级都不满足才判失效。
+    """
+    api = site.get("api") or site.get("url") or ""
+    ext = site.get("ext") or ""
+    spider = site.get("spider") or ""
+
+    def abs_url(u, base):
+        u = (u or "").strip()
+        if not u:
+            return ""
+        if u.startswith(("http://", "https://")):
+            return u
+        if u.startswith("//") and base:
+            return base.split("://", 1)[0] + ":" + u
+        # 相对路径（./ext/xxx.js）：以叶子配置地址为基准解析
+        if base:
+            try:
+                from urllib.parse import urljoin
+                return urljoin(base, u)
+            except Exception:
+                return ""
+        return ""
+
+    base = site.get("_source_url", "")
+    candidates = []
+    for raw in (ext, spider):
+        u = abs_url(raw, base)
+        if u and u not in candidates:
+            candidates.append(u)
+
+    # 脚本优先用 ext（配置脚本），其次 spider 包
+    loaded = []
+    for u in candidates[:3]:
+        txt, err = _load_script(u, cfg)
+        if txt:
+            loaded.append((u, txt))
+
+    # 策略 1：真实接口还原
+    if cfg.get("spider_extract_api", True):
+        for u, script in loaded:
+            for real_api in extract_api_from_script(script, cfg):
+                ok, note, got_vod = probe_http_api(real_api, cfg)
+                if ok and got_vod:
+                    site["api"] = real_api
+                    site["_restored_from"] = api
+                    return True, "爬虫源·接口还原有效(%s): %s" % (u.rsplit("/", 1)[-1][:20], note)
+
+    # 策略 2：依赖可达即保留
+    if loaded:
+        u = loaded[0][0]
+        site["_crawler"] = True
+        return True, "爬虫源·依赖可达未测内容(%s)" % u.rsplit("/", 1)[-1][:24]
+
+    # 站点带 spider 包字段，但脚本取不到（可能站点本身即标识）
+    if api.startswith("csp_") and cfg.get("spider_keep_if_unreachable", True):
+        site["_crawler"] = True
+        return True, "爬虫源·依赖未取到(csp包)，按配置保留"
+
+    if candidates:
+        return False, "爬虫源·脚本不可达"
+    return False, "爬虫源·无依赖地址可验证"
+
+
+def probe_site(site, cfg):
+    """测活单个站点，返回 (是否存活, 说明)。
+
+    http api：多关键词测活 + 网络抖动重试（见 probe_http_api / http_get）
+    非 http：csp/js 爬虫源走接口还原 + 依赖可达兜底（见 probe_spider_site）
+    """
+    api = site.get("api") or site.get("url") or ""
+    if not api:
+        return False, "无 api"
+    if not api.startswith(("http://", "https://")):
+        return probe_spider_site(site, cfg)
+    ok, note, _ = probe_http_api(api, cfg)
+    return ok, note
 
 
 def site_key(site):
@@ -701,10 +926,22 @@ def merge_subscription(leaves, alive_sites, cfg):
     normal_sites, adult_sites = [], []
     for s in alive_sites:
         is_ad = bool(s.pop("_adult", False)) and mode == "mark"
+        is_crawler = bool(s.pop("_crawler", False))
+        restored = bool(s.pop("_restored_from", None))
         s.pop("_source", None)
         s.pop("_sources", None)
+        s.pop("_source_url", None)
+        s.pop("_leaf_spider", None)
         if is_ad:
             s["name"] = mark_adult_name(s.get("name", ""), cfg)
+        # 爬虫源在名称前加标注，便于在影视仓里识别（接口已还原的不标）。
+        # 放在成人脱敏之后，避免成人站的 1BJ 代号覆盖掉爬虫标注。
+        crawler_tag = cfg.get("crawler_name_tag", "[爬]")
+        if is_crawler and not restored and crawler_tag:
+            nm = str(s.get("name", ""))
+            if crawler_tag not in nm:
+                s["name"] = crawler_tag + nm
+        if is_ad:
             adult_sites.append(s)
         else:
             normal_sites.append(s)
@@ -866,9 +1103,13 @@ def main():
 
     report.append("## 测活汇总")
     report.append("")
+    crawler_alive = [d for d in details if d[0] and "爬虫源" in (d[3] or "")]
+    crawler_restored = [d for d in crawler_alive if "接口还原有效" in (d[3] or "")]
     report.append("- 存活站点(去重后): %d" % len(alive))
     report.append("- 存活率: %.1f%%" % ((len(alive) / total * 100) if total else 0))
     report.append("- 其中成人内容存活(已标注): %d" % len(adult_alive_details))
+    report.append("- 其中爬虫源保留: %d（接口还原有效 %d / 依赖可达待验证 %d）" % (
+        len(crawler_alive), len(crawler_restored), len(crawler_alive) - len(crawler_restored)))
     report.append("")
 
     # 成人内容清单：名称 + 网址 + 来源仓（用户要求标注出来并给出网址）
