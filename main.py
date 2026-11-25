@@ -553,6 +553,66 @@ def build_probe_url(api, keyword):
     return api + sep + "wd=" + kw
 
 
+def build_home_urls(api):
+    """影视仓加载「首页数据源」时实际请求的列表接口地址（按优先级）。
+
+    关键：影视仓预检数据源用的是采集列表接口（api 本身或 ?ac=videolist），
+    不是搜索接口 wd=xxx。搜索能返回视频 ≠ 首页能列出视频，这正是
+    「订阅显示很多站、影视仓只列出少数」的根因。
+    返回去重后的候选 URL 列表。
+    """
+    urls = [api]
+    p = urlparse(api)
+    base = "%s://%s%s" % (p.scheme, p.netloc, p.path)
+    urls.append(base + "?ac=videolist&pg=1")
+    out, seen = [], set()
+    for u in urls:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
+def probe_home_visible(api, cfg):
+    """按影视仓加载首页的方式（列表接口）判活一个 http api。
+
+    返回 (是否拿到真视频, 说明, 耗时ms, 是否网络错误)。
+    只要任一列表接口形态返回真实视频条目，即认为影视仓首页可见。
+    """
+    t0 = time.time()
+
+    def ms():
+        return int(round((time.time() - t0) * 1000))
+
+    last_note = "列表接口无有效响应"
+    any_http = False  # 是否至少有一个形态真正拿到了 HTTP 响应（区别于全网络错误）
+    for url in build_home_urls(api):
+        text, status, err = http_get(url, cfg)
+        if err or text is None:
+            last_note = err or "请求失败"
+            continue
+        any_http = True
+        body = text.strip()
+        if len(body) < int(cfg.get("min_body", 20)):
+            last_note = "响应过短(status=%s)" % status
+            continue
+        lower = body.lower()
+        hit_bad = False
+        for bad in cfg.get("bad_keywords", []):
+            if bad and bad.lower() in lower:
+                last_note = "命中异常关键词: %s" % bad
+                hit_bad = True
+                break
+        if hit_bad:
+            continue
+        kind, note = classify_content(body, cfg)
+        if kind == "vod":
+            return True, note, ms(), False
+        last_note = note
+    # 所有形态都网络失败 → 标记网络错误，调用方跳过搜索兜底（避免白等超时）
+    return False, last_note, ms(), not any_http
+
+
 # ---- 内容校验：判断响应体是否真的是「视频源内容」 ----
 # 视频条目常见字段（苹果 CMS / TVBox 各类聚合接口）
 _VOD_ITEM_KEYS = (
@@ -887,6 +947,7 @@ def probe_site(site, cfg):
     """
     site["_latency_ms"] = 0
     site["_probe_kind"] = "fail"
+    site["_home_visible"] = False
     api = site.get("api") or site.get("url") or ""
     if not api:
         return False, "无 api"
@@ -897,6 +958,26 @@ def probe_site(site, cfg):
         if not site.get("_latency_ms"):
             site["_latency_ms"] = int(round((time.time() - t0) * 1000))
         return ok, note
+
+    # 影视仓标准：先用「列表接口」判活（首页能否列出视频）。
+    # 只有列表接口拿到真视频，才标记 _home_visible=True，才可能进主订阅。
+    if cfg.get("home_list_check", True):
+        vis, vis_note, vis_ms, net_err = probe_home_visible(api, cfg)
+        if vis:
+            site["_latency_ms"] = vis_ms
+            site["_probe_kind"] = "vod"
+            site["_home_visible"] = True
+            return True, "影视仓可见(列表接口): " + vis_note
+        if net_err:
+            # 列表接口全网络失败：仅用单关键词回退搜索一次，让站至少进全量订阅保命，
+            # 但不做多关键词重试，避免每个失效站白等 N 次超时拖慢整体。
+            site["_latency_ms"] = vis_ms
+            fallback_cfg = dict(cfg)
+            fallback_cfg["probe_keyword_limit"] = 1
+            ok, note, _ = probe_http_api(api, fallback_cfg, site=site)
+            return ok, note
+
+    # 列表接口有响应但拿不到视频 → 回退搜索接口兜底（仍算存活，但不进主订阅）
     ok, note, _ = probe_http_api(api, cfg, site=site)
     return ok, note
 
@@ -941,6 +1022,38 @@ def sort_sites_by_speed(sites):
     return sorted(sites, key=speed_sort_key)
 
 
+def main_rank_key(site):
+    """主订阅优先级排序键。
+
+    影视仓可见真视频 > 搜索接口真视频 > 标准空结果站 > 爬虫/其他；同级按响应耗时升序。
+    「可见站优先」保证影视仓能列出的站一定排在最前，其余存活站按顺序补足到 60。
+    """
+    visible = bool(site.get("_home_visible"))
+    kind = site.get("_probe_kind", "")
+    if visible and kind == "vod":
+        tier = 0
+    elif kind == "vod":
+        tier = 1
+    elif kind == "empty":
+        tier = 2
+    else:
+        tier = 3
+    return (tier, int(site.get("_latency_ms", 0) or 0))
+
+
+def pick_main_sites(alive_sites, cfg, include_adult=False):
+    """从全部存活站里选出主订阅候选。
+
+    先按 main_rank_key 分层排序（影视仓可见站优先），再取前 main_top_n 个。
+    存活站不足 top_n 时有多少取多少。默认只在非成人站中选（成人单独订阅）。
+    返回 (完整分层排序列表, Top N 列表)，均为站点对象引用（尚未清理内部字段）。
+    """
+    top_n = int(cfg.get("main_top_n", 60) or 0)
+    pool = [s for s in alive_sites if include_adult or not s.get("_adult")]
+    ranked = sorted(pool, key=main_rank_key)
+    return ranked, (ranked[:top_n] if top_n > 0 else list(ranked))
+
+
 def build_base_config(leaves, cfg):
     """以第一个有效单仓配置为模板，按需保留 lives/parses。"""
     base = {}
@@ -967,6 +1080,7 @@ def _clean_site_for_output(s, cfg):
     s.pop("_leaf_spider", None)
     s.pop("_latency_ms", None)   # 速度数据不写进订阅文件
     s.pop("_probe_kind", None)
+    s.pop("_home_visible", None)
     if is_ad:
         s["name"] = mark_adult_name(s.get("name", ""), cfg)
     # 爬虫源在名称前加标注，便于在影视仓里识别（接口已还原的不标）。
@@ -1015,25 +1129,42 @@ def merge_subscription(leaves, alive_sites, cfg):
     mode = adult_mode(cfg)
     placement = adult_placement(cfg) if mode == "mark" else "mix"
     base = build_base_config(leaves, cfg)
+    top_n = int(cfg.get("main_top_n", 60) or 0)
+
+    # 清理前先按「影视仓可见优先 + 分层速度」选出主订阅入选站（常规站，对象引用）
+    _, main_selected = pick_main_sites(alive_sites, cfg, include_adult=False)
 
     normal_sites, adult_sites = [], []
+    adult_pool = []          # 混排模式下主订阅的成人可见站
+    cleaned_by_id = {}
+    home_visible_count = 0   # 影视仓可见真视频站总数（常规）
     for s in alive_sites:
+        # 必须在 _clean_site_for_output 清除内部标记之前读取
+        visible = bool(s.get("_home_visible"))
+        kind = s.get("_probe_kind", "")
+        if visible and kind == "vod" and not s.get("_adult"):
+            home_visible_count += 1
         cleaned, is_ad, _is_crawler, _restored = _clean_site_for_output(s, cfg)
+        cleaned_by_id[id(s)] = cleaned
         if is_ad:
             adult_sites.append(cleaned)
+            if visible and kind == "vod":
+                adult_pool.append(cleaned)
         else:
             normal_sites.append(cleaned)
+
+    # 主订阅入选站：按分层优先级顺序（可见站优先，其余存活站补足），取清理后的对象
+    main_pool = [cleaned_by_id[id(s)] for s in main_selected]
 
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     # 全量订阅：所有常规站点，按传入顺序（已按速度排序）
     full_sub = _make_sub(base, normal_sites, cfg, "all", stamp,
                          {"total_before_top": len(normal_sites)})
-    # 主订阅：Top N
-    top_n = int(cfg.get("main_top_n", 60) or 0)
-    top_sites = normal_sites[:top_n] if top_n > 0 else list(normal_sites)
-    main_sub = _make_sub(base, top_sites, cfg, placement, stamp,
+    # 主订阅：分层补足到 Top N（可见真视频站优先 → 搜索真视频 → 空结果 → 爬虫）
+    main_sub = _make_sub(base, main_pool, cfg, placement, stamp,
                          {"top_n": top_n if top_n > 0 else None,
-                          "full_site_count": len(normal_sites)})
+                          "full_site_count": len(normal_sites),
+                          "home_visible_pool": home_visible_count})
 
     if placement == "separate":
         adult_sub = _make_sub(base, adult_sites, cfg, "separate", stamp,
@@ -1041,11 +1172,12 @@ def merge_subscription(leaves, alive_sites, cfg):
         return main_sub, full_sub, adult_sub, len(adult_sites)
 
     if placement == "mix":
-        # 混排：主订阅与全量订阅都把成人站点带标注混排进来（同样 Top N 限制）
-        # 站点已在 _clean_site_for_output 前按速度排好，这里直接拼接即可
+        # 混排：全量订阅含所有站；主订阅 = 分层补足的常规 Top N + 可见成人站
         mixed = normal_sites + adult_sites
-        main_sub = _make_sub(base, mixed[:top_n] if top_n > 0 else mixed,
-                             cfg, "mix", stamp, {"adult_marked": len(adult_sites)})
+        main_mixed = main_pool + list(adult_pool)
+        main_sub = _make_sub(base, main_mixed, cfg, "mix", stamp,
+                             {"adult_marked": len(adult_sites),
+                              "home_visible_pool": home_visible_count})
         full_sub = _make_sub(base, mixed, cfg, "all", stamp, {"adult_marked": len(adult_sites)})
         return main_sub, full_sub, None, len(adult_sites)
 
@@ -1193,21 +1325,37 @@ def main():
 
     top_n = int(cfg.get("main_top_n", 60) or 0)
     normal_alive = [s for s in alive if not s.get("_adult")]
-    main_count = min(top_n, len(normal_alive)) if top_n > 0 else len(normal_alive)
-    report.append("- 主订阅(展示用): 速度最快的前 %d 站（常规存活 %d 站）" % (main_count, len(normal_alive)))
+    home_pool = [s for s in normal_alive
+                 if s.get("_home_visible") and s.get("_probe_kind") == "vod"]
+    ranked_normal, main_selected = pick_main_sites(alive, cfg, include_adult=False)
+    main_count = len(main_selected)
+    # 主订阅入选里各层数量
+    n_visible = sum(1 for s in main_selected
+                    if s.get("_home_visible") and s.get("_probe_kind") == "vod")
+    n_vod = sum(1 for s in main_selected
+                if (not s.get("_home_visible")) and s.get("_probe_kind") == "vod")
+    n_empty = sum(1 for s in main_selected if s.get("_probe_kind") == "empty")
+    n_crawler = main_count - n_visible - n_vod - n_empty
+    report.append("- 影视仓可见站(列表接口验证有视频): %d 站" % len(home_pool))
+    report.append("- 主订阅(展示用): 补足至 %d 站（可见真视频 %d + 搜索真视频 %d + 空结果 %d + 其他 %d；常规存活 %d）" % (
+        main_count, n_visible, n_vod, n_empty, n_crawler, len(normal_alive)))
     report.append("- 全量订阅: 全部 %d 站，按接入速度从高到低排序" % len(normal_alive))
     report.append("")
 
-    # 速度排行榜：主订阅入选的快速站点
+    # 速度排行榜：主订阅入选的快速站点（与订阅文件严格一致）
     if cfg.get("speed_report", True):
-        report.append("## 最快站点 Top %d（主订阅入选，按响应耗时升序）" % main_count)
+        report.append("## 最快站点 Top %d（主订阅入选，可见站优先+分层补足，按响应耗时升序）" % main_count)
         report.append("")
         report.append("| 排名 | 站点 | 响应耗时 | 测活结果 | 网址(api) |")
         report.append("| --- | --- | --- | --- | --- |")
-        for rank, s in enumerate(normal_alive[:main_count], 1):
+        for rank, s in enumerate(main_selected, 1):
             lat = s.get("_latency_ms", 0)
             kind = s.get("_probe_kind", "")
             kind_label = {"vod": "有效视频", "empty": "空结果", "crawler": "爬虫未测内容"}.get(kind, kind or "-")
+            if s.get("_home_visible") and kind == "vod":
+                kind_label = "影视仓可见·" + kind_label
+            elif kind == "vod":
+                kind_label = "搜索验证·" + kind_label
             disp = mark_adult_name(s.get("name", "?"), cfg) if s.get("_adult") else s.get("name", "?")
             report.append("| %d | %s | %d ms | %s | %s |" % (
                 rank, md_cell(disp), lat, kind_label, md_cell(s.get("api", ""))))
